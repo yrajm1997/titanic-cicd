@@ -1,0 +1,134 @@
+# This workflow will train the model, test it, build a .whl file, dockerize the api, push the docker image to DockerHub, and start a new container on specified machine.
+
+name: CICD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]           # this event is used to trigger the workflow when changes are pushed to repository's main branch
+  workflow_dispatch:               # this event allows you to manually trigger a workflow from the GitHub interface
+
+jobs:
+  train:                           # job name -> 'train'
+    runs-on: ubuntu-24.04          # type of machine (GitHub Runner) where this job will be executed
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3          # github action to checkout the current code in repo
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3      # github actions to set up python 3.10
+      with:
+        python-version: '3.10'
+    - name: Install dependencies                            # one of the step under 'train' job
+      run: pip install -r project/requirements/requirements.txt     # command(s) to execute under this step
+    - name: Train and save pipeline                      # another step
+      run: python project/titanic_model/train_pipeline.py        # command to execute under this step
+    - uses: actions/upload-artifact@v4              # github action to upload the artifact (to use them later in other jobs)
+      with:
+        name: my-trained-pipeline
+        path: project/titanic_model/trained_models/*.pkl    # saving the trained model as an artifact
+        retention-days: 1                           # to keep this artifact in storage for 1 day
+
+  test:                           # another job -> 'test'
+    needs: train                  # run the 'test' job only after the 'train' job is done
+    runs-on: ubuntu-24.04         # type of machine (GitHub Runner) where this job will be executed
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: '3.10'
+    - uses: actions/download-artifact@v4         # github action to download the artifact(created during the execution of previous jobs)
+      with:
+        name: my-trained-pipeline
+        path: project/titanic_model/trained_models
+    - name: Install test dependencies
+      run: pip install -r project/requirements/test_requirements.txt
+    - name: Test with pytest
+      run: pytest
+
+  build:                           # another job -> 'test'
+    needs: [train, test]           # run the 'build' job only after the 'train' & 'test' job is done
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: '3.10'
+    - uses: actions/download-artifact@v4
+      with:
+        name: my-trained-pipeline
+        path: project/titanic_model/trained_models
+    - name: Install dependencies
+      run: pip install --upgrade build
+    - name: Build package
+      run: |
+        cd project
+        python -m build
+    - uses: actions/upload-artifact@v4
+      with:
+        name: my-build-package
+        path: project/dist/*.whl
+        retention-days: 1
+
+  push-image:
+    needs: [train, test, build]
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Repo Checkout
+      uses: actions/checkout@v3
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: my-build-package
+        path: project/titanic_model_api
+
+    - name: Login to Docker hub
+      env:
+        DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASS_TOKEN }}
+      run: docker login -u $DOCKER_USER -p $DOCKER_PASSWORD 
+
+    - name: Build the Docker image for Fastapi app
+      env:
+        DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
+      run: |
+        cd project
+        docker build . -f Dockerfile -t $DOCKER_USER/titanic-api-img:latest
+
+    - name: Push the Docker Image
+      env:
+        DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}
+      run: docker push $DOCKER_USER/titanic-api-img:latest
+
+    - name: Logout to Docker hub
+      run: docker logout
+
+
+  deploy:
+    needs: [train, test, build, push-image]
+    runs-on: ubuntu-24.04
+
+    env:
+      IMG_NAME: titanic-api-img             # docker image name
+      IMG_TAG: latest                       # image tag  
+      CONT_NAME: titanic-api-container      # container name
+      DOCKER_USER: ${{ secrets.DOCKER_USER_NAME }}     # dockerhub user name
+
+    steps:
+      - name: Pull Docker Image
+        run: sudo docker pull $DOCKER_USER/$IMG_NAME:$IMG_TAG
+    
+      - name: Delete Old Docker Container
+        run: sudo docker rm -f $CONT_NAME || true
+    
+      - name: Run Docker Container
+        run: sudo docker run -it -d -p 8001:8001 --name=$CONT_NAME $DOCKER_USER/$IMG_NAME:$IMG_TAG
+
+      - name: Check the running Container
+        run: sudo docker ps
+
